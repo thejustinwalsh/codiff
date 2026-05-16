@@ -72,3 +72,15 @@ export type DiffSectionContentRequest = {
 export type CodiffPreferences = {
   showWhitespace: boolean;
 };
+
+export type DifftRunRequest = {
+  newContents: string;
+  newName: string;
+  oldContents: string;
+  oldName: string;
+};
+
+export type DifftRunResult = {
+  error?: string;
+  json?: string;
+};
