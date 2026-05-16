@@ -9,6 +9,7 @@ import {
 import { CodeView, type CodeViewHandle, WorkerPoolContextProvider } from '@pierre/diffs/react';
 import { FileTree, useFileTree } from '@pierre/trees/react';
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
+import { buildFileDiff, parseDifftJson } from './difftastic.ts';
 import dunkelTheme from './themes/dunkel.json' with { type: 'json' };
 import lichtTheme from './themes/licht.json' with { type: 'json' };
 import type {
@@ -18,6 +19,9 @@ import type {
   GitFileStatus,
   RepositoryState,
 } from './types.ts';
+
+type DiffEngine = 'codiff' | 'difftastic';
+type DifftJsonState = 'error' | { json: string };
 
 type CodeViewInstance = NonNullable<ReturnType<CodeViewHandle<undefined>['getInstance']>>;
 
@@ -63,8 +67,8 @@ const codeViewItemMetrics = {
   diffHeaderHeight: 54,
 };
 
-const workerHighlighterOptions = {
-  lineDiffType: 'char' as const,
+const createWorkerHighlighterOptions = (engine: DiffEngine) => ({
+  lineDiffType: engine === 'difftastic' ? ('word-alt' as const) : ('char' as const),
   maxLineDiffLength: 2000,
   theme: {
     dark: 'Dunkel',
@@ -72,7 +76,7 @@ const workerHighlighterOptions = {
   },
   tokenizeMaxLineLength: 20_000,
   useTokenTransformer: false,
-};
+});
 
 const maxWorkerThreads = 3;
 
@@ -293,10 +297,16 @@ const parseSectionDiffWithOptions = (
   file: ChangedFile,
   section: DiffSection,
   showWhitespace: boolean,
+  engine: DiffEngine,
+  difftJson: string | null,
 ): FileDiffMetadata => {
-  const cacheKey = `${file.fingerprint}:${section.id}:${getSectionCacheIdentity(section)}:${
+  const baseCacheKey = `${file.fingerprint}:${section.id}:${getSectionCacheIdentity(section)}:${
     showWhitespace ? 'ws' : 'ignore-ws'
   }`;
+  const cacheKey =
+    engine === 'difftastic' && difftJson
+      ? `${baseCacheKey}:difft:${difftJson.length}:${difftJson.slice(0, 64)}`
+      : `${baseCacheKey}:codiff`;
   const cached = parsedDiffCache.get(cacheKey);
   if (cached) {
     return cached;
@@ -305,6 +315,8 @@ const parseSectionDiffWithOptions = (
   let fileDiff: FileDiffMetadata;
   if (section.binary || (section.loadState != null && section.loadState !== 'ready')) {
     fileDiff = createBinaryFileDiff(file, section);
+  } else if (engine === 'difftastic' && difftJson && section.oldFile && section.newFile) {
+    fileDiff = parseSectionWithDifftastic(file, section, difftJson, cacheKey);
   } else if (section.oldFile && section.newFile) {
     try {
       fileDiff = {
@@ -330,6 +342,35 @@ const parseSectionDiffWithOptions = (
   return fileDiff;
 };
 
+const parseSectionWithDifftastic = (
+  file: ChangedFile,
+  section: DiffSection,
+  difftJson: string,
+  cacheKey: string,
+): FileDiffMetadata => {
+  try {
+    const difftFile = parseDifftJson(difftJson)[0];
+    if (difftFile) {
+      const built = buildFileDiff(
+        difftFile,
+        section.oldFile?.contents ?? '',
+        section.newFile?.contents ?? '',
+      );
+      if (built) {
+        return { ...built, cacheKey, name: section.newFile?.name ?? file.path };
+      }
+      return createEmptyFileDiff(file, section);
+    }
+  } catch {
+    // Fall through to codiff engine.
+  }
+
+  return {
+    ...parseDiffFromFile(section.oldFile!, section.newFile!, { ignoreWhitespace: false }),
+    cacheKey,
+  };
+};
+
 const fileHasMetadataDiff = (file: ChangedFile) =>
   file.status === 'renamed' && file.oldPath != null && file.oldPath !== file.path;
 
@@ -343,19 +384,38 @@ const sectionHasVisibleDiff = (
   fileHasMetadataDiff(file) ||
   fileDiff.hunks.length > 0;
 
-export const getVisibleDiffSections = (file: ChangedFile, showWhitespace: boolean) =>
+export const getVisibleDiffSections = (
+  file: ChangedFile,
+  showWhitespace: boolean,
+  engine: DiffEngine = 'codiff',
+  difftJsonBySection: Readonly<Record<string, string>> = {},
+) =>
   file.sections
     .map((section) => ({
-      fileDiff: parseSectionDiffWithOptions(file, section, showWhitespace),
+      fileDiff: parseSectionDiffWithOptions(
+        file,
+        section,
+        showWhitespace,
+        engine,
+        difftJsonBySection[section.id] ?? null,
+      ),
       section,
     }))
     .filter(({ fileDiff, section }) => sectionHasVisibleDiff(file, section, fileDiff));
 
-export const fileHasVisibleDiff = (file: ChangedFile, showWhitespace: boolean) =>
-  getVisibleDiffSections(file, showWhitespace).length > 0;
+export const fileHasVisibleDiff = (
+  file: ChangedFile,
+  showWhitespace: boolean,
+  engine: DiffEngine = 'codiff',
+  difftJsonBySection: Readonly<Record<string, string>> = {},
+) => getVisibleDiffSections(file, showWhitespace, engine, difftJsonBySection).length > 0;
 
-const getFirstVisibleSection = (file: ChangedFile, showWhitespace: boolean) =>
-  getVisibleDiffSections(file, showWhitespace)[0]?.section;
+const getFirstVisibleSection = (
+  file: ChangedFile,
+  showWhitespace: boolean,
+  engine: DiffEngine,
+  difftJsonBySection: Readonly<Record<string, string>>,
+) => getVisibleDiffSections(file, showWhitespace, engine, difftJsonBySection)[0]?.section;
 
 function Sidebar({
   files,
@@ -590,6 +650,8 @@ function CodeViewHeader({
 
 function ReviewCodeView({
   collapsed,
+  diffEngine,
+  difftJsonBySection,
   files,
   itemVersionByPath,
   onSelectPathFromScroll,
@@ -601,6 +663,8 @@ function ReviewCodeView({
   viewed,
 }: {
   collapsed: ReadonlySet<string>;
+  diffEngine: DiffEngine;
+  difftJsonBySection: Readonly<Record<string, string>>;
   files: ReadonlyArray<ChangedFile>;
   itemVersionByPath: Readonly<Record<string, number>>;
   onSelectPathFromScroll: (viewer: CodeViewInstance) => void;
@@ -622,7 +686,12 @@ function ReviewCodeView({
     for (const file of files) {
       const isViewed = viewed[file.path] === file.fingerprint;
       const isCollapsed = collapsed.has(file.path);
-      const visibleSections = getVisibleDiffSections(file, showWhitespace);
+      const visibleSections = getVisibleDiffSections(
+        file,
+        showWhitespace,
+        diffEngine,
+        difftJsonBySection,
+      );
       const sections = isCollapsed ? visibleSections.slice(0, 1) : visibleSections;
 
       for (const [index, { fileDiff, section }] of sections.entries()) {
@@ -646,7 +715,9 @@ function ReviewCodeView({
               isCollapsed ? 'collapsed' : 'open'
             }:${isViewed ? 'viewed' : 'pending'}:${index}:${
               selectedPath === file.path ? 'selected' : 'idle'
-            }:${showWhitespace ? 'ws' : 'ignore-ws'}`,
+            }:${showWhitespace ? 'ws' : 'ignore-ws'}:${diffEngine}:${
+              difftJsonBySection[section.id]?.length ?? 0
+            }`,
           ),
         });
       }
@@ -657,7 +728,16 @@ function ReviewCodeView({
       itemMetadata: nextItemMetadata,
       items: nextItems,
     };
-  }, [collapsed, files, itemVersionByPath, selectedPath, showWhitespace, viewed]);
+  }, [
+    collapsed,
+    diffEngine,
+    difftJsonBySection,
+    files,
+    itemVersionByPath,
+    selectedPath,
+    showWhitespace,
+    viewed,
+  ]);
 
   const codeViewOptions: CodeViewOptions<undefined> = useMemo(
     () =>
@@ -668,7 +748,7 @@ function ReviewCodeView({
         hunkSeparators: 'simple',
         itemMetrics: codeViewItemMetrics,
         layout: codeViewLayout,
-        lineDiffType: 'char',
+        lineDiffType: diffEngine === 'difftastic' ? 'word-alt' : 'char',
         stickyHeaders: true,
         theme: {
           dark: 'Dunkel',
@@ -678,7 +758,12 @@ function ReviewCodeView({
         tokenizeMaxLength: 100_000,
         unsafeCSS: codeViewUnsafeCSS,
       }) satisfies CodeViewOptions<undefined>,
-    [],
+    [diffEngine],
+  );
+
+  const workerHighlighterOptions = useMemo(
+    () => createWorkerHighlighterOptions(diffEngine),
+    [diffEngine],
   );
 
   const workerPoolOptions = useMemo(
@@ -786,6 +871,28 @@ function ReviewCodeView({
   );
 }
 
+function DiffEngineToggle({
+  engine,
+  onChange,
+}: {
+  engine: DiffEngine;
+  onChange: (next: DiffEngine) => void;
+}) {
+  const isOn = engine === 'difftastic';
+  return (
+    <button
+      aria-label="Toggle Difftastic diff engine"
+      aria-pressed={isOn}
+      className={`diff-engine-toggle${isOn ? ' active' : ''}`}
+      onClick={() => onChange(isOn ? 'codiff' : 'difftastic')}
+      title={isOn ? 'Using difftastic' : 'Using codiff diff engine'}
+      type="button"
+    >
+      Difft
+    </button>
+  );
+}
+
 function RepositoryChangeBanner({ visible }: { visible: boolean }) {
   return (
     <div aria-live="polite" className={`repository-change-banner${visible ? ' visible' : ''}`}>
@@ -799,6 +906,9 @@ function RepositoryChangeBanner({ visible }: { visible: boolean }) {
 
 export default function App() {
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [difftAvailable, setDifftAvailable] = useState(false);
+  const [difftEnginePreference, setDifftEnginePreference] = useState<DiffEngine>('codiff');
+  const [difftJsonBySection, setDifftJsonBySection] = useState<Record<string, DifftJsonState>>({});
   const [error, setError] = useState<string | null>(null);
   const [itemVersionByPath, setItemVersionByPath] = useState<Record<string, number>>({});
   const [localChangesDetected, setLocalChangesDetected] = useState(false);
@@ -809,8 +919,19 @@ export default function App() {
   const [state, setState] = useState<RepositoryState | null>(null);
   const [viewed, setViewed] = useState<Record<string, string>>({});
   const loadingSectionKeysRef = useRef<Set<string>>(new Set());
+  const difftLoadingSectionsRef = useRef<Set<string>>(new Set());
   const programmaticScrollPathRef = useRef<string | null>(null);
   const programmaticScrollTimerRef = useRef<number | null>(null);
+
+  const difftJsonStringsBySection = useMemo(() => {
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(difftJsonBySection)) {
+      if (typeof value === 'object') {
+        result[key] = value.json;
+      }
+    }
+    return result;
+  }, [difftJsonBySection]);
 
   const bumpItemVersion = useCallback((path: string) => {
     setItemVersionByPath((current) => ({
@@ -998,17 +1119,79 @@ export default function App() {
     [],
   );
 
+  useEffect(() => {
+    let canceled = false;
+    window.codiff.isDifftAvailable().then((available) => {
+      if (!canceled) {
+        setDifftAvailable(available);
+      }
+    });
+    return () => {
+      canceled = true;
+    };
+  }, []);
+
   const showWhitespace = preferences.showWhitespace;
+  const diffEngine: DiffEngine =
+    difftEnginePreference === 'difftastic' && difftAvailable ? 'difftastic' : 'codiff';
+
   const visibleFiles = useMemo(
     () =>
       state
         ? sortFiles(state.files).filter(
             (file) =>
-              fuzzyMatches(file.path, searchQuery) && fileHasVisibleDiff(file, showWhitespace),
+              fuzzyMatches(file.path, searchQuery) &&
+              fileHasVisibleDiff(file, showWhitespace, diffEngine, difftJsonStringsBySection),
           )
         : [],
-    [searchQuery, showWhitespace, state],
+    [diffEngine, difftJsonStringsBySection, searchQuery, showWhitespace, state],
   );
+
+  useEffect(() => {
+    if (diffEngine !== 'difftastic' || !state) {
+      return;
+    }
+
+    for (const file of visibleFiles) {
+      for (const section of file.sections) {
+        if (
+          section.binary ||
+          (section.loadState != null && section.loadState !== 'ready') ||
+          !section.oldFile ||
+          !section.newFile ||
+          difftJsonBySection[section.id] ||
+          difftLoadingSectionsRef.current.has(section.id)
+        ) {
+          continue;
+        }
+
+        difftLoadingSectionsRef.current.add(section.id);
+
+        const oldContents = section.oldFile.contents;
+        const newContents = section.newFile.contents;
+        const oldName = section.oldFile.name;
+        const newName = section.newFile.name;
+
+        window.codiff
+          .runDifft({ newContents, newName, oldContents, oldName })
+          .then((result) => {
+            setDifftJsonBySection((current) => ({
+              ...current,
+              [section.id]: result.json ? { json: result.json } : 'error',
+            }));
+          })
+          .catch(() => {
+            setDifftJsonBySection((current) => ({
+              ...current,
+              [section.id]: 'error',
+            }));
+          })
+          .finally(() => {
+            difftLoadingSectionsRef.current.delete(section.id);
+          });
+      }
+    }
+  }, [diffEngine, difftJsonBySection, state, visibleFiles]);
 
   const selectPath = useCallback((path: string) => {
     setSelectedPath(path);
@@ -1059,7 +1242,12 @@ export default function App() {
       let nextDistance = Number.NEGATIVE_INFINITY;
 
       for (const file of visibleFiles) {
-        const section = getFirstVisibleSection(file, showWhitespace);
+        const section = getFirstVisibleSection(
+          file,
+          showWhitespace,
+          diffEngine,
+          difftJsonStringsBySection,
+        );
         const itemId = section ? getItemId(section) : null;
         const itemTop = itemId ? viewer.getTopForItem(itemId) : undefined;
         if (itemTop == null) {
@@ -1090,7 +1278,7 @@ export default function App() {
         setSelectedPath((current) => (current === nextPath ? current : nextPath));
       }
     },
-    [showWhitespace, visibleFiles],
+    [diffEngine, difftJsonStringsBySection, showWhitespace, visibleFiles],
   );
 
   const toggleViewed = useCallback(
@@ -1160,6 +1348,9 @@ export default function App() {
             <div className="sidebar-path" title={state.root}>
               {compactPath(state.root)}
             </div>
+            {difftAvailable ? (
+              <DiffEngineToggle engine={diffEngine} onChange={setDifftEnginePreference} />
+            ) : null}
           </div>
         </div>
         <Sidebar
@@ -1191,6 +1382,8 @@ export default function App() {
         ) : (
           <ReviewCodeView
             collapsed={collapsed}
+            diffEngine={diffEngine}
+            difftJsonBySection={difftJsonStringsBySection}
             files={visibleFiles}
             itemVersionByPath={itemVersionByPath}
             onSelectPathFromScroll={updateSelectedPathFromScroll}

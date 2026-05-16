@@ -171,10 +171,43 @@
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 600;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   transform: translateY(-6px);
   white-space: nowrap;
+}
+
+.diff-engine-toggle {
+  -webkit-app-region: no-drag;
+  background: transparent;
+  border: 1px solid var(--sidebar-border);
+  border-radius: 9px;
+  color: var(--sidebar-text);
+  corner-shape: squircle;
+  cursor: pointer;
+  flex: none;
+  font: 600 11px/1 var(--font-sans);
+  letter-spacing: 0.04em;
+  margin-left: 8px;
+  opacity: 0.6;
+  padding: 4px 8px;
+  text-transform: uppercase;
+  transform: translateY(-4px);
+  transition:
+    opacity 120ms,
+    background 120ms;
+}
+
+.diff-engine-toggle:hover {
+  opacity: 0.9;
+}
+
+.diff-engine-toggle.active {
+  background: rgb(61 135 245 / 0.18);
+  border-color: rgb(61 135 245 / 0.4);
+  color: rgb(61 135 245);
+  opacity: 1;
 }
 
 .sidebar-search-row {

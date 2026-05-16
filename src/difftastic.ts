@@ -40,12 +40,7 @@ export type DifftFile = {
 
 const CONTEXT_LINES = 4;
 
-// Difftastic emits one aligned_lines row per file row plus a phantom EOF
-// row pointing one past the last real line on both sides (its convention
-// for representing the trailing newline). Surfacing that row to the
-// renderer makes additionLineIndex/deletionLineIndex run off the end of
-// the file's line arrays, which the CodeView prints as `undefined`. Trim
-// those trailing phantom rows here.
+// Trim difft's trailing phantom EOF row to keep indices within file arrays.
 const dropPhantomEofRows = (
   alignedLines: DifftFile['aligned_lines'],
   deletionLineCount: number,
@@ -245,8 +240,6 @@ const buildHunk = (
     }
   }
 
-  // Default base for empty rows (e.g. a hunk that starts with a filler) —
-  // fall back to the file-level position so indices remain monotonic.
   const additionBase = additionStartIndex ?? resolved[0]?.deletionLineIndex ?? 0;
   const deletionBase = deletionStartIndex ?? resolved[0]?.additionLineIndex ?? 0;
 
