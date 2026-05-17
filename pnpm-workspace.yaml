@@ -17,6 +17,7 @@ onlyBuiltDependencies:
 overrides:
   vite: 'catalog:'
   vitest: 'catalog:'
+  '@pierre/diffs': 'file:/tmp/pierre-diffs-difft-ranges.tgz'
 peerDependencyRules:
   allowAny:
     - vite

@@ -1,4 +1,4 @@
-import type { ChangeContent, ContextContent, FileDiffMetadata, Hunk } from '@pierre/diffs';
+import type { FileIntraLineRanges, Hunk, IntraLineRange } from '@pierre/diffs';
 
 export type DifftStatus = 'changed' | 'created' | 'deleted' | 'unchanged';
 
@@ -38,42 +38,19 @@ export type DifftFile = {
   status: DifftStatus;
 };
 
-const CONTEXT_LINES = 4;
+const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder('utf-8');
 
-// Trim difft's trailing phantom EOF row to keep indices within file arrays.
-const dropPhantomEofRows = (
-  alignedLines: DifftFile['aligned_lines'],
-  deletionLineCount: number,
-  additionLineCount: number,
-): DifftFile['aligned_lines'] => {
-  let end = alignedLines.length;
-  while (end > 0) {
-    const [lhs, rhs] = alignedLines[end - 1];
-    const lhsExceeds = lhs === null || lhs >= deletionLineCount;
-    const rhsExceeds = rhs === null || rhs >= additionLineCount;
-    if (lhsExceeds && rhsExceeds) {
-      end -= 1;
-    } else {
-      break;
-    }
+// Difft offsets are UTF-8 bytes; pierre wants UTF-16 chars.
+const byteToCharOffset = (line: string, byteOffset: number): number => {
+  if (byteOffset <= 0) {
+    return 0;
   }
-  return end === alignedLines.length ? alignedLines : alignedLines.slice(0, end);
-};
-
-const splitFileLines = (contents: string): { lines: Array<string>; noEOF: boolean } => {
-  if (contents.length === 0) {
-    return { lines: [], noEOF: false };
+  const bytes = utf8Encoder.encode(line);
+  if (byteOffset >= bytes.length) {
+    return line.length;
   }
-
-  if (contents.endsWith('\n')) {
-    const trimmed = contents.slice(0, -1);
-    const parts = trimmed.length === 0 ? [''] : trimmed.split('\n');
-    return { lines: parts.map((line) => `${line}\n`), noEOF: false };
-  }
-
-  const parts = contents.split('\n');
-  const lines = parts.map((line, index) => (index < parts.length - 1 ? `${line}\n` : line));
-  return { lines, noEOF: true };
+  return utf8Decoder.decode(bytes.subarray(0, byteOffset)).length;
 };
 
 export const parseDifftJson = (stdout: string): ReadonlyArray<DifftFile> => {
@@ -81,406 +58,179 @@ export const parseDifftJson = (stdout: string): ReadonlyArray<DifftFile> => {
   if (trimmed.length === 0) {
     return [];
   }
-
   if (trimmed.startsWith('[')) {
     return JSON.parse(trimmed) as ReadonlyArray<DifftFile>;
   }
-
   return trimmed
     .split('\n')
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line) as DifftFile);
 };
 
-type RowKind = 'context' | 'add' | 'del' | 'mod';
-
-type ResolvedRow = {
-  additionLineIndex: number | null;
-  deletionLineIndex: number | null;
-  kind: RowKind;
-};
-
-type HunkRange = {
-  endRow: number;
-  startRow: number;
-};
-
-const buildChangedRowSet = (
-  alignedLines: DifftFile['aligned_lines'],
-  chunks: DifftFile['chunks'],
-): Set<number> => {
-  const lhsChangedLines = new Set<number>();
-  const rhsChangedLines = new Set<number>();
-
-  for (const chunk of chunks) {
-    for (const row of chunk) {
-      if (row.lhs) {
-        lhsChangedLines.add(row.lhs.line_number);
-      }
-      if (row.rhs) {
-        rhsChangedLines.add(row.rhs.line_number);
-      }
-    }
-  }
-
-  const changed = new Set<number>();
-  for (const [index, [lhs, rhs]] of alignedLines.entries()) {
-    if (lhs === null || rhs === null) {
-      changed.add(index);
-      continue;
-    }
-    if (lhsChangedLines.has(lhs) || rhsChangedLines.has(rhs)) {
-      changed.add(index);
-    }
-  }
-  return changed;
-};
-
-const computeHunkRanges = (
-  changedRows: Set<number>,
-  totalRows: number,
-): ReadonlyArray<HunkRange> => {
-  if (changedRows.size === 0 || totalRows === 0) {
+const splitLines = (contents: string): ReadonlyArray<string> => {
+  if (contents.length === 0) {
     return [];
   }
-
-  const sorted = [...changedRows].sort((left, right) => left - right);
-  const ranges: Array<HunkRange> = [];
-
-  for (const changedRow of sorted) {
-    const startRow = Math.max(0, changedRow - CONTEXT_LINES);
-    const endRow = Math.min(totalRows - 1, changedRow + CONTEXT_LINES);
-    const last = ranges.at(-1);
-
-    if (last && startRow <= last.endRow + 1) {
-      last.endRow = Math.max(last.endRow, endRow);
-    } else {
-      ranges.push({ endRow, startRow });
-    }
+  const parts = contents.split('\n');
+  if (parts.at(-1) === '') {
+    parts.pop();
   }
-
-  return ranges;
+  return parts;
 };
 
-const resolveRow = (
-  alignedLines: DifftFile['aligned_lines'],
-  rowIndex: number,
-  changedRows: Set<number>,
-): ResolvedRow => {
-  const [lhs, rhs] = alignedLines[rowIndex];
-  const isChange = changedRows.has(rowIndex);
-  let kind: RowKind;
-  if (!isChange) {
-    kind = 'context';
-  } else if (lhs === null) {
-    kind = 'add';
-  } else if (rhs === null) {
-    kind = 'del';
-  } else {
-    kind = 'mod';
-  }
+const collectLineBuckets = (
+  difftFile: DifftFile,
+  oldLines: ReadonlyArray<string>,
+  newLines: ReadonlyArray<string>,
+) => {
+  const lhsByLine = new Map<number, Array<IntraLineRange>>();
+  const rhsByLine = new Map<number, Array<IntraLineRange>>();
 
-  return {
-    additionLineIndex: rhs,
-    deletionLineIndex: lhs,
-    kind,
-  };
-};
-
-type HunkBuildResult = {
-  hunk: Hunk;
-  splitLines: number;
-  unifiedLines: number;
-};
-
-const buildHunk = (
-  range: HunkRange,
-  alignedLines: DifftFile['aligned_lines'],
-  changedRows: Set<number>,
-  collapsedBefore: number,
-  splitLineStart: number,
-  unifiedLineStart: number,
-  noEOFLastAdditionLineIndex: number | null,
-  noEOFLastDeletionLineIndex: number | null,
-  noEOFAdditions: boolean,
-  noEOFDeletions: boolean,
-): HunkBuildResult => {
-  const resolved: Array<ResolvedRow> = [];
-  for (let index = range.startRow; index <= range.endRow; index += 1) {
-    resolved.push(resolveRow(alignedLines, index, changedRows));
-  }
-
-  let additionStartIndex: number | null = null;
-  let deletionStartIndex: number | null = null;
-  let additionRowCount = 0;
-  let deletionRowCount = 0;
-  let addedLineCount = 0;
-  let deletedLineCount = 0;
-
-  for (const row of resolved) {
-    if (row.additionLineIndex !== null) {
-      if (additionStartIndex === null) {
-        additionStartIndex = row.additionLineIndex;
-      }
-      additionRowCount += 1;
-    }
-    if (row.deletionLineIndex !== null) {
-      if (deletionStartIndex === null) {
-        deletionStartIndex = row.deletionLineIndex;
-      }
-      deletionRowCount += 1;
-    }
-    if (row.kind === 'add') {
-      addedLineCount += 1;
-    } else if (row.kind === 'del') {
-      deletedLineCount += 1;
-    } else if (row.kind === 'mod') {
-      addedLineCount += 1;
-      deletedLineCount += 1;
-    }
-  }
-
-  const additionBase = additionStartIndex ?? resolved[0]?.deletionLineIndex ?? 0;
-  const deletionBase = deletionStartIndex ?? resolved[0]?.additionLineIndex ?? 0;
-
-  const hunkContent: Array<ChangeContent | ContextContent> = [];
-  let cursor = 0;
-  let runningAdditionIndex = additionBase;
-  let runningDeletionIndex = deletionBase;
-
-  while (cursor < resolved.length) {
-    const row = resolved[cursor];
-    if (row.kind === 'context') {
-      let runEnd = cursor;
-      while (runEnd < resolved.length && resolved[runEnd].kind === 'context') {
-        runEnd += 1;
-      }
-      const lines = runEnd - cursor;
-      hunkContent.push({
-        additionLineIndex: runningAdditionIndex,
-        deletionLineIndex: runningDeletionIndex,
-        lines,
-        type: 'context',
-      });
-      runningAdditionIndex += lines;
-      runningDeletionIndex += lines;
-      cursor = runEnd;
-      continue;
-    }
-
-    let runEnd = cursor;
-    let additionsInRun = 0;
-    let deletionsInRun = 0;
-    while (runEnd < resolved.length && resolved[runEnd].kind !== 'context') {
-      const block = resolved[runEnd];
-      if (block.kind === 'add') {
-        additionsInRun += 1;
-      } else if (block.kind === 'del') {
-        deletionsInRun += 1;
+  const pushChanges = (
+    target: Map<number, Array<IntraLineRange>>,
+    lineNumber: number,
+    line: string,
+    changes: ReadonlyArray<DifftChange>,
+    isOneSided: boolean,
+  ) => {
+    // Detect difft's per-character fallback (seen on template-literal
+    // continuations and similar): a long run of adjacent 1-byte ranges
+    // means difft gave up on structural pairing and just emitted every
+    // byte. Suppress regardless of pairing — there's nothing to compare.
+    let run = 0;
+    let maxRun = 0;
+    let lastEnd = Number.NEGATIVE_INFINITY;
+    for (const change of changes) {
+      const isSingleByte = change.end - change.start === 1;
+      if (isSingleByte && change.start === lastEnd) {
+        run += 1;
+      } else if (isSingleByte) {
+        run = 1;
       } else {
-        additionsInRun += 1;
-        deletionsInRun += 1;
+        run = 0;
       }
-      runEnd += 1;
+      if (run > maxRun) {
+        maxRun = run;
+      }
+      lastEnd = change.end;
     }
-    hunkContent.push({
-      additionLineIndex: runningAdditionIndex,
-      additions: additionsInRun,
-      deletionLineIndex: runningDeletionIndex,
-      deletions: deletionsInRun,
-      type: 'change',
-    });
-    runningAdditionIndex += additionsInRun;
-    runningDeletionIndex += deletionsInRun;
-    cursor = runEnd;
-  }
-
-  let splitLines = 0;
-  let unifiedLines = 0;
-  for (const block of hunkContent) {
-    if (block.type === 'context') {
-      splitLines += block.lines;
-      unifiedLines += block.lines;
-    } else {
-      splitLines += Math.max(block.additions, block.deletions);
-      unifiedLines += block.additions + block.deletions;
+    if (maxRun >= 5) {
+      return;
     }
-  }
 
-  const lastAdditionIndex = runningAdditionIndex - 1;
-  const lastDeletionIndex = runningDeletionIndex - 1;
-  const noEOFAdditionsForHunk =
-    noEOFAdditions &&
-    noEOFLastAdditionLineIndex !== null &&
-    lastAdditionIndex === noEOFLastAdditionLineIndex;
-  const noEOFDeletionsForHunk =
-    noEOFDeletions &&
-    noEOFLastDeletionLineIndex !== null &&
-    lastDeletionIndex === noEOFLastDeletionLineIndex;
+    // One-sided rows (pure add/delete in difft's chunk) with every
+    // non-whitespace byte covered are just visual noise — the row-level
+    // bg already conveys it. Paired rows keep their boxes so the user
+    // can compare lhs↔rhs token-for-token.
+    if (isOneSided) {
+      const lineBytes = utf8Encoder.encode(line);
+      if (lineBytes.length > 0) {
+        const covered = new Uint8Array(lineBytes.length);
+        for (const change of changes) {
+          const start = Math.max(0, change.start);
+          const end = Math.min(lineBytes.length, change.end);
+          for (let i = start; i < end; i += 1) {
+            covered[i] = 1;
+          }
+        }
+        let hasUncoveredToken = false;
+        for (let i = 0; i < lineBytes.length; i += 1) {
+          const byte = lineBytes[i];
+          if (!covered[i] && byte !== 0x20 && byte !== 0x09) {
+            hasUncoveredToken = true;
+            break;
+          }
+        }
+        if (!hasUncoveredToken) {
+          return;
+        }
+      }
+    }
 
-  const hunk: Hunk = {
-    additionCount: additionRowCount,
-    additionLineIndex: additionBase,
-    additionLines: addedLineCount,
-    additionStart: additionBase + 1,
-    collapsedBefore,
-    deletionCount: deletionRowCount,
-    deletionLineIndex: deletionBase,
-    deletionLines: deletedLineCount,
-    deletionStart: deletionBase + 1,
-    hunkContent,
-    hunkSpecs: `@@ -${deletionBase + 1},${deletionRowCount} +${additionBase + 1},${additionRowCount} @@\n`,
-    noEOFCRAdditions: noEOFAdditionsForHunk,
-    noEOFCRDeletions: noEOFDeletionsForHunk,
-    splitLineCount: splitLines,
-    splitLineStart,
-    unifiedLineCount: unifiedLines,
-    unifiedLineStart,
+    let list = target.get(lineNumber);
+    for (const change of changes) {
+      const start = byteToCharOffset(line, change.start);
+      const end = byteToCharOffset(line, change.end);
+      if (end <= start) {
+        continue;
+      }
+      if (!list) {
+        list = [];
+        target.set(lineNumber, list);
+      }
+      list.push({ end, start });
+    }
   };
 
-  return { hunk, splitLines, unifiedLines };
+  for (const chunk of difftFile.chunks) {
+    for (const row of chunk) {
+      const isOneSided = !(row.lhs && row.rhs);
+      if (row.lhs && row.lhs.line_number < oldLines.length) {
+        pushChanges(
+          lhsByLine,
+          row.lhs.line_number,
+          oldLines[row.lhs.line_number],
+          row.lhs.changes,
+          isOneSided,
+        );
+      }
+      if (row.rhs && row.rhs.line_number < newLines.length) {
+        pushChanges(
+          rhsByLine,
+          row.rhs.line_number,
+          newLines[row.rhs.line_number],
+          row.rhs.changes,
+          isOneSided,
+        );
+      }
+    }
+  }
+
+  return { lhsByLine, rhsByLine };
 };
 
-const buildSingleChunkHunk = (
-  type: 'add' | 'del',
-  lineCount: number,
-): { hunk: Hunk; splitLines: number; unifiedLines: number } => {
-  const additions = type === 'add' ? lineCount : 0;
-  const deletions = type === 'del' ? lineCount : 0;
-
-  const hunk: Hunk = {
-    additionCount: additions,
-    additionLineIndex: 0,
-    additionLines: additions,
-    additionStart: additions > 0 ? 1 : 0,
-    collapsedBefore: 0,
-    deletionCount: deletions,
-    deletionLineIndex: 0,
-    deletionLines: deletions,
-    deletionStart: deletions > 0 ? 1 : 0,
-    hunkContent: [
-      {
-        additionLineIndex: 0,
-        additions,
-        deletionLineIndex: 0,
-        deletions,
-        type: 'change',
-      },
-    ],
-    hunkSpecs: `@@ -${deletions > 0 ? 1 : 0},${deletions} +${additions > 0 ? 1 : 0},${additions} @@\n`,
-    noEOFCRAdditions: false,
-    noEOFCRDeletions: false,
-    splitLineCount: lineCount,
-    splitLineStart: 0,
-    unifiedLineCount: lineCount,
-    unifiedLineStart: 0,
-  };
-
-  return { hunk, splitLines: lineCount, unifiedLines: lineCount };
-};
-
-export const buildFileDiff = (
-  file: DifftFile,
+// Always returns a non-null object so pierre's char/word fallback never
+// fires — empty entries leave rows undecorated rather than re-running
+// char-diff on them.
+export const buildIntraLineRangesForHunks = (
+  difftFile: DifftFile,
+  hunks: ReadonlyArray<Hunk>,
   oldContents: string,
   newContents: string,
-): FileDiffMetadata | null => {
-  const { lines: additionLines, noEOF: noEOFAdditions } = splitFileLines(newContents);
-  const { lines: deletionLines, noEOF: noEOFDeletions } = splitFileLines(oldContents);
+): FileIntraLineRanges => {
+  // Text-mode means difft bailed (unsupported language or DFT_GRAPH_LIMIT
+  // exceeded); its per-char output is no better than pierre's char-diff.
+  if (difftFile.language === 'Text' || difftFile.language.startsWith('Text (')) {
+    return { additions: {}, deletions: {} };
+  }
+  const oldLines = splitLines(oldContents);
+  const newLines = splitLines(newContents);
+  const { lhsByLine, rhsByLine } = collectLineBuckets(difftFile, oldLines, newLines);
 
-  if (file.status === 'unchanged') {
-    return null;
+  const deletions: Record<number, Array<IntraLineRange>> = {};
+  const additions: Record<number, Array<IntraLineRange>> = {};
+
+  for (const hunk of hunks) {
+    for (const content of hunk.hunkContent) {
+      if (content.type !== 'change') {
+        continue;
+      }
+      for (let i = 0; i < content.deletions; i += 1) {
+        const delIdx = content.deletionLineIndex + i;
+        const delRanges = lhsByLine.get(delIdx);
+        if (delRanges && delRanges.length > 0) {
+          deletions[delIdx] = delRanges;
+        }
+      }
+      for (let i = 0; i < content.additions; i += 1) {
+        const addIdx = content.additionLineIndex + i;
+        const addRanges = rhsByLine.get(addIdx);
+        if (addRanges && addRanges.length > 0) {
+          additions[addIdx] = addRanges;
+        }
+      }
+    }
   }
 
-  if (file.status === 'created') {
-    const result = buildSingleChunkHunk('add', additionLines.length);
-    return {
-      additionLines,
-      cacheKey: undefined,
-      deletionLines,
-      hunks: additionLines.length > 0 ? [result.hunk] : [],
-      isPartial: false,
-      name: file.path,
-      splitLineCount: result.splitLines,
-      type: 'new',
-      unifiedLineCount: result.unifiedLines,
-    };
-  }
-
-  if (file.status === 'deleted') {
-    const result = buildSingleChunkHunk('del', deletionLines.length);
-    return {
-      additionLines,
-      cacheKey: undefined,
-      deletionLines,
-      hunks: deletionLines.length > 0 ? [result.hunk] : [],
-      isPartial: false,
-      name: file.path,
-      splitLineCount: result.splitLines,
-      type: 'deleted',
-      unifiedLineCount: result.unifiedLines,
-    };
-  }
-
-  const alignedLines = dropPhantomEofRows(
-    file.aligned_lines,
-    deletionLines.length,
-    additionLines.length,
-  );
-  const changedRows = buildChangedRowSet(alignedLines, file.chunks);
-  const ranges = computeHunkRanges(changedRows, alignedLines.length);
-
-  if (ranges.length === 0) {
-    return {
-      additionLines,
-      cacheKey: undefined,
-      deletionLines,
-      hunks: [],
-      isPartial: false,
-      name: file.path,
-      splitLineCount: 0,
-      type: 'change',
-      unifiedLineCount: 0,
-    };
-  }
-
-  const noEOFLastAdditionLineIndex = additionLines.length > 0 ? additionLines.length - 1 : null;
-  const noEOFLastDeletionLineIndex = deletionLines.length > 0 ? deletionLines.length - 1 : null;
-
-  const hunks: Array<Hunk> = [];
-  let splitLineCount = 0;
-  let unifiedLineCount = 0;
-  let previousEndRow = -1;
-
-  for (const range of ranges) {
-    const collapsedBefore =
-      previousEndRow === -1 ? range.startRow : range.startRow - previousEndRow - 1;
-    const built = buildHunk(
-      range,
-      alignedLines,
-      changedRows,
-      collapsedBefore,
-      splitLineCount,
-      unifiedLineCount,
-      noEOFLastAdditionLineIndex,
-      noEOFLastDeletionLineIndex,
-      noEOFAdditions,
-      noEOFDeletions,
-    );
-    hunks.push(built.hunk);
-    splitLineCount += built.splitLines;
-    unifiedLineCount += built.unifiedLines;
-    previousEndRow = range.endRow;
-  }
-
-  return {
-    additionLines,
-    cacheKey: undefined,
-    deletionLines,
-    hunks,
-    isPartial: false,
-    name: file.path,
-    splitLineCount,
-    type: 'change',
-    unifiedLineCount,
-  };
+  return { additions, deletions };
 };

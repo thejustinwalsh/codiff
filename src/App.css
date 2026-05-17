@@ -178,38 +178,6 @@
   white-space: nowrap;
 }
 
-.diff-engine-toggle {
-  -webkit-app-region: no-drag;
-  background: transparent;
-  border: 1px solid var(--sidebar-border);
-  border-radius: 9px;
-  color: var(--sidebar-text);
-  corner-shape: squircle;
-  cursor: pointer;
-  flex: none;
-  font: 600 11px/1 var(--font-sans);
-  letter-spacing: 0.04em;
-  margin-left: 8px;
-  opacity: 0.6;
-  padding: 4px 8px;
-  text-transform: uppercase;
-  transform: translateY(-4px);
-  transition:
-    opacity 120ms,
-    background 120ms;
-}
-
-.diff-engine-toggle:hover {
-  opacity: 0.9;
-}
-
-.diff-engine-toggle.active {
-  background: rgb(61 135 245 / 0.18);
-  border-color: rgb(61 135 245 / 0.4);
-  color: rgb(61 135 245);
-  opacity: 1;
-}
-
 .sidebar-search-row {
   border-bottom: 1px solid var(--sidebar-border);
   flex: none;
@@ -288,8 +256,29 @@
   display: grid;
   gap: 10px;
   height: 54px;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   padding: 9px 10px;
+}
+
+.codiff-difft-spinner {
+  border: 2px solid transparent;
+  border-radius: 50%;
+  height: 14px;
+  visibility: hidden;
+  width: 14px;
+}
+
+.codiff-difft-spinner[data-loading='true'] {
+  animation: codiff-difft-spin 0.7s linear infinite;
+  border-color: rgb(127 127 127 / 0.2);
+  border-top-color: var(--text);
+  visibility: visible;
+}
+
+@keyframes codiff-difft-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .codiff-file-header.selected {

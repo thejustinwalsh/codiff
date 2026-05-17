@@ -69,7 +69,8 @@ const runDifft = async ({ oldContents = '', oldName = 'file', newContents = '', 
       ['--display=json', '--color=never', oldFilePath, newFilePath],
       {
         encoding: 'utf8',
-        env: { ...process.env, DFT_UNSTABLE: 'yes' },
+        // 10x the default (3M) to keep more files in structural mode.
+        env: { ...process.env, DFT_GRAPH_LIMIT: '30000000', DFT_UNSTABLE: 'yes' },
         maxBuffer: 1024 * 1024 * 64,
       },
     );

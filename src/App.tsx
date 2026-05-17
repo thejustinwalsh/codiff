@@ -9,7 +9,7 @@ import {
 import { CodeView, type CodeViewHandle, WorkerPoolContextProvider } from '@pierre/diffs/react';
 import { FileTree, useFileTree } from '@pierre/trees/react';
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
-import { buildFileDiff, parseDifftJson } from './difftastic.ts';
+import { buildIntraLineRangesForHunks, parseDifftJson } from './difftastic.ts';
 import dunkelTheme from './themes/dunkel.json' with { type: 'json' };
 import lichtTheme from './themes/licht.json' with { type: 'json' };
 import type {
@@ -22,6 +22,20 @@ import type {
 
 type DiffEngine = 'codiff' | 'difftastic';
 type DifftJsonState = 'error' | { json: string };
+
+type DifftQueueEntry = {
+  newContents: string;
+  newName: string;
+  oldContents: string;
+  oldName: string;
+  path: string;
+  sectionId: string;
+};
+
+// Rapid scrolling: keep ≤6 difft processes running and evict the oldest
+// queued entry when a new request arrives past the queue cap.
+const DIFFT_MAX_INFLIGHT = 6;
+const DIFFT_QUEUE_MAX = 8;
 
 type CodeViewInstance = NonNullable<ReturnType<CodeViewHandle<undefined>['getInstance']>>;
 
@@ -67,8 +81,8 @@ const codeViewItemMetrics = {
   diffHeaderHeight: 54,
 };
 
-const createWorkerHighlighterOptions = (engine: DiffEngine) => ({
-  lineDiffType: engine === 'difftastic' ? ('word-alt' as const) : ('char' as const),
+const workerHighlighterOptions = {
+  lineDiffType: 'char' as const,
   maxLineDiffLength: 2000,
   theme: {
     dark: 'Dunkel',
@@ -76,7 +90,7 @@ const createWorkerHighlighterOptions = (engine: DiffEngine) => ({
   },
   tokenizeMaxLineLength: 20_000,
   useTokenTransformer: false,
-});
+};
 
 const maxWorkerThreads = 3;
 
@@ -220,6 +234,7 @@ const getItemVersion = (value: string) => {
 type CodeViewItemMetadata = {
   file: ChangedFile;
   isCollapsed: boolean;
+  isDifftLoading: boolean;
   isSelected: boolean;
   isViewed: boolean;
   section: DiffSection;
@@ -282,7 +297,57 @@ const createEmptyFileDiff = (file: ChangedFile, section: DiffSection): FileDiffM
   unifiedLineCount: 0,
 });
 
+// LRU cap on the parsed FileDiffMetadata cache, measured in UTF-16 chars
+// (~100MB JS heap). A single oversize entry overshoots; next insert evicts.
+const PARSED_CACHE_MAX_CHARS = 50 * 1024 * 1024;
+
 const parsedDiffCache = new Map<string, FileDiffMetadata>();
+const parsedDiffCacheSizes = new Map<string, number>();
+let parsedDiffCacheCharTotal = 0;
+
+const measureFileDiffSize = (diff: FileDiffMetadata): number => {
+  let size = 0;
+  for (const line of diff.additionLines) {
+    size += line.length;
+  }
+  for (const line of diff.deletionLines) {
+    size += line.length;
+  }
+  return size;
+};
+
+const evictParsedCacheEntry = (key: string) => {
+  parsedDiffCacheCharTotal -= parsedDiffCacheSizes.get(key) ?? 0;
+  parsedDiffCacheSizes.delete(key);
+  parsedDiffCache.delete(key);
+};
+
+const getCachedParsedDiff = (key: string): FileDiffMetadata | undefined => {
+  const cached = parsedDiffCache.get(key);
+  if (cached) {
+    // LRU touch via re-insert (Map preserves insertion order).
+    parsedDiffCache.delete(key);
+    parsedDiffCache.set(key, cached);
+  }
+  return cached;
+};
+
+const setCachedParsedDiff = (key: string, diff: FileDiffMetadata) => {
+  if (parsedDiffCache.has(key)) {
+    evictParsedCacheEntry(key);
+  }
+  const size = measureFileDiffSize(diff);
+  parsedDiffCache.set(key, diff);
+  parsedDiffCacheSizes.set(key, size);
+  parsedDiffCacheCharTotal += size;
+  while (parsedDiffCacheCharTotal > PARSED_CACHE_MAX_CHARS && parsedDiffCache.size > 1) {
+    const oldestKey = parsedDiffCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    evictParsedCacheEntry(oldestKey);
+  }
+};
 
 const getSectionCacheIdentity = (section: DiffSection) =>
   [
@@ -304,10 +369,12 @@ const parseSectionDiffWithOptions = (
     showWhitespace ? 'ws' : 'ignore-ws'
   }`;
   const cacheKey =
-    engine === 'difftastic' && difftJson
-      ? `${baseCacheKey}:difft:${difftJson.length}:${difftJson.slice(0, 64)}`
+    engine === 'difftastic'
+      ? difftJson
+        ? `${baseCacheKey}:difft:${difftJson.length}:${difftJson.slice(0, 64)}`
+        : `${baseCacheKey}:difft-pending`
       : `${baseCacheKey}:codiff`;
-  const cached = parsedDiffCache.get(cacheKey);
+  const cached = getCachedParsedDiff(cacheKey);
   if (cached) {
     return cached;
   }
@@ -315,16 +382,22 @@ const parseSectionDiffWithOptions = (
   let fileDiff: FileDiffMetadata;
   if (section.binary || (section.loadState != null && section.loadState !== 'ready')) {
     fileDiff = createBinaryFileDiff(file, section);
-  } else if (engine === 'difftastic' && difftJson && section.oldFile && section.newFile) {
-    fileDiff = parseSectionWithDifftastic(file, section, difftJson, cacheKey);
   } else if (section.oldFile && section.newFile) {
     try {
-      fileDiff = {
-        ...parseDiffFromFile(section.oldFile, section.newFile, {
-          ignoreWhitespace: !showWhitespace,
-        }),
-        cacheKey,
-      };
+      const base = parseDiffFromFile(section.oldFile, section.newFile, {
+        ignoreWhitespace: !showWhitespace,
+      });
+      const overlayed =
+        engine === 'difftastic'
+          ? overlayDifftRanges(
+              base,
+              difftJson,
+              section.oldFile.contents,
+              section.newFile.contents,
+              file.path,
+            )
+          : base;
+      fileDiff = { ...overlayed, cacheKey };
     } catch {
       fileDiff = createEmptyFileDiff(file, section);
     }
@@ -338,37 +411,41 @@ const parseSectionDiffWithOptions = (
       : createBinaryFileDiff(file, section);
   }
 
-  parsedDiffCache.set(cacheKey, fileDiff);
+  setCachedParsedDiff(cacheKey, fileDiff);
   return fileDiff;
 };
 
-const parseSectionWithDifftastic = (
-  file: ChangedFile,
-  section: DiffSection,
-  difftJson: string,
-  cacheKey: string,
+const EMPTY_INTRA_LINE_RANGES = { additions: {}, deletions: {} };
+
+// Always attach intraLineRanges in difft mode (empty when JSON is pending
+// or errored) so pierre's char-diff fallback never fires.
+const overlayDifftRanges = (
+  base: FileDiffMetadata,
+  difftJson: string | null,
+  oldContents: string,
+  newContents: string,
+  path: string,
 ): FileDiffMetadata => {
+  if (!difftJson) {
+    return { ...base, intraLineRanges: EMPTY_INTRA_LINE_RANGES };
+  }
   try {
     const difftFile = parseDifftJson(difftJson)[0];
-    if (difftFile) {
-      const built = buildFileDiff(
-        difftFile,
-        section.oldFile?.contents ?? '',
-        section.newFile?.contents ?? '',
-      );
-      if (built) {
-        return { ...built, cacheKey, name: section.newFile?.name ?? file.path };
-      }
-      return createEmptyFileDiff(file, section);
+    if (!difftFile) {
+      return { ...base, intraLineRanges: EMPTY_INTRA_LINE_RANGES };
     }
-  } catch {
-    // Fall through to codiff engine.
+    const intraLineRanges = buildIntraLineRangesForHunks(
+      difftFile,
+      base.hunks,
+      oldContents,
+      newContents,
+    );
+    return { ...base, intraLineRanges };
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error(`[difft] failed to parse JSON for ${path}:`, error);
+    return { ...base, intraLineRanges: EMPTY_INTRA_LINE_RANGES };
   }
-
-  return {
-    ...parseDiffFromFile(section.oldFile!, section.newFile!, { ignoreWhitespace: false }),
-    cacheKey,
-  };
 };
 
 const fileHasMetadataDiff = (file: ChangedFile) =>
@@ -605,7 +682,7 @@ function CodeViewHeader({
   onToggleCollapsed: (file: ChangedFile, isCollapsed: boolean) => void;
   onToggleViewed: (file: ChangedFile, isViewed: boolean) => void;
 }) {
-  const { file, isCollapsed, isSelected, isViewed, section, sectionCount } = meta;
+  const { file, isCollapsed, isDifftLoading, isSelected, isViewed, section, sectionCount } = meta;
 
   return (
     <div
@@ -634,6 +711,12 @@ function CodeViewHeader({
           </span>
         ) : null}
       </button>
+      <span
+        aria-hidden={!isDifftLoading}
+        aria-label={isDifftLoading ? 'Computing structural diff' : undefined}
+        className="codiff-difft-spinner"
+        data-loading={isDifftLoading ? 'true' : 'false'}
+      />
       <div className={`codiff-status-badge ${file.status}`}>{statusLabel[file.status]}</div>
       <button
         aria-pressed={isViewed}
@@ -652,6 +735,7 @@ function ReviewCodeView({
   collapsed,
   diffEngine,
   difftJsonBySection,
+  difftLoadingSections,
   files,
   itemVersionByPath,
   onSelectPathFromScroll,
@@ -665,6 +749,7 @@ function ReviewCodeView({
   collapsed: ReadonlySet<string>;
   diffEngine: DiffEngine;
   difftJsonBySection: Readonly<Record<string, string>>;
+  difftLoadingSections: ReadonlySet<string>;
   files: ReadonlyArray<ChangedFile>;
   itemVersionByPath: Readonly<Record<string, number>>;
   onSelectPathFromScroll: (viewer: CodeViewInstance) => void;
@@ -696,9 +781,11 @@ function ReviewCodeView({
 
       for (const [index, { fileDiff, section }] of sections.entries()) {
         const id = getItemId(section);
+        const isDifftLoading = difftLoadingSections.has(section.id);
         nextItemMetadata.set(id, {
           file,
           isCollapsed,
+          isDifftLoading,
           isSelected: selectedPath === file.path,
           isViewed,
           section,
@@ -717,7 +804,7 @@ function ReviewCodeView({
               selectedPath === file.path ? 'selected' : 'idle'
             }:${showWhitespace ? 'ws' : 'ignore-ws'}:${diffEngine}:${
               difftJsonBySection[section.id]?.length ?? 0
-            }`,
+            }:${isDifftLoading ? 'difft-loading' : 'difft-idle'}`,
           ),
         });
       }
@@ -732,6 +819,7 @@ function ReviewCodeView({
     collapsed,
     diffEngine,
     difftJsonBySection,
+    difftLoadingSections,
     files,
     itemVersionByPath,
     selectedPath,
@@ -748,7 +836,7 @@ function ReviewCodeView({
         hunkSeparators: 'simple',
         itemMetrics: codeViewItemMetrics,
         layout: codeViewLayout,
-        lineDiffType: diffEngine === 'difftastic' ? 'word-alt' : 'char',
+        lineDiffType: 'char',
         stickyHeaders: true,
         theme: {
           dark: 'Dunkel',
@@ -758,12 +846,7 @@ function ReviewCodeView({
         tokenizeMaxLength: 100_000,
         unsafeCSS: codeViewUnsafeCSS,
       }) satisfies CodeViewOptions<undefined>,
-    [diffEngine],
-  );
-
-  const workerHighlighterOptions = useMemo(
-    () => createWorkerHighlighterOptions(diffEngine),
-    [diffEngine],
+    [],
   );
 
   const workerPoolOptions = useMemo(
@@ -871,28 +954,6 @@ function ReviewCodeView({
   );
 }
 
-function DiffEngineToggle({
-  engine,
-  onChange,
-}: {
-  engine: DiffEngine;
-  onChange: (next: DiffEngine) => void;
-}) {
-  const isOn = engine === 'difftastic';
-  return (
-    <button
-      aria-label="Toggle Difftastic diff engine"
-      aria-pressed={isOn}
-      className={`diff-engine-toggle${isOn ? ' active' : ''}`}
-      onClick={() => onChange(isOn ? 'codiff' : 'difftastic')}
-      title={isOn ? 'Using difftastic' : 'Using codiff diff engine'}
-      type="button"
-    >
-      Difft
-    </button>
-  );
-}
-
 function RepositoryChangeBanner({ visible }: { visible: boolean }) {
   return (
     <div aria-live="polite" className={`repository-change-banner${visible ? ' visible' : ''}`}>
@@ -907,7 +968,6 @@ function RepositoryChangeBanner({ visible }: { visible: boolean }) {
 export default function App() {
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const [difftAvailable, setDifftAvailable] = useState(false);
-  const [difftEnginePreference, setDifftEnginePreference] = useState<DiffEngine>('codiff');
   const [difftJsonBySection, setDifftJsonBySection] = useState<Record<string, DifftJsonState>>({});
   const [error, setError] = useState<string | null>(null);
   const [itemVersionByPath, setItemVersionByPath] = useState<Record<string, number>>({});
@@ -918,8 +978,12 @@ export default function App() {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [state, setState] = useState<RepositoryState | null>(null);
   const [viewed, setViewed] = useState<Record<string, string>>({});
+  const [difftLoadingSections, setDifftLoadingSections] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const loadingSectionKeysRef = useRef<Set<string>>(new Set());
-  const difftLoadingSectionsRef = useRef<Set<string>>(new Set());
+  const difftQueueRef = useRef<Array<DifftQueueEntry>>([]);
+  const difftInflightRef = useRef<Set<string>>(new Set());
   const programmaticScrollPathRef = useRef<string | null>(null);
   const programmaticScrollTimerRef = useRef<number | null>(null);
 
@@ -1132,8 +1196,7 @@ export default function App() {
   }, []);
 
   const showWhitespace = preferences.showWhitespace;
-  const diffEngine: DiffEngine =
-    difftEnginePreference === 'difftastic' && difftAvailable ? 'difftastic' : 'codiff';
+  const diffEngine: DiffEngine = difftAvailable ? 'difftastic' : 'codiff';
 
   const visibleFiles = useMemo(
     () =>
@@ -1145,6 +1208,160 @@ export default function App() {
           )
         : [],
     [diffEngine, difftJsonStringsBySection, searchQuery, showWhitespace, state],
+  );
+
+  const syncDifftLoading = useCallback(() => {
+    setDifftLoadingSections((current) => {
+      const next = new Set<string>(difftInflightRef.current);
+      for (const entry of difftQueueRef.current) {
+        next.add(entry.sectionId);
+      }
+      if (next.size === current.size) {
+        let same = true;
+        for (const id of next) {
+          if (!current.has(id)) {
+            same = false;
+            break;
+          }
+        }
+        if (same) {
+          return current;
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  // Drop cached entries for sections no longer in the working set.
+  useEffect(() => {
+    if (!state) {
+      return;
+    }
+    const liveSectionIds = new Set<string>();
+    const liveFingerprintSectionPrefixes = new Set<string>();
+    for (const file of state.files) {
+      for (const section of file.sections) {
+        liveSectionIds.add(section.id);
+        liveFingerprintSectionPrefixes.add(`${file.fingerprint}:${section.id}`);
+      }
+    }
+
+    // eslint-disable-next-line react-hooks-js/set-state-in-effect -- prune depends only on `state`; the no-op return short-circuits cascading updates.
+    setDifftJsonBySection((current) => {
+      let pruned = false;
+      const next: Record<string, DifftJsonState> = {};
+      for (const [id, value] of Object.entries(current)) {
+        if (liveSectionIds.has(id)) {
+          next[id] = value;
+        } else {
+          pruned = true;
+        }
+      }
+      return pruned ? next : current;
+    });
+
+    // parsedDiffCache keys are `${fingerprint}:${sectionId}:${rest...}`.
+    const staleCacheKeys: Array<string> = [];
+    for (const key of parsedDiffCache.keys()) {
+      const firstColon = key.indexOf(':');
+      if (firstColon === -1) {
+        continue;
+      }
+      const secondColon = key.indexOf(':', firstColon + 1);
+      if (secondColon === -1) {
+        continue;
+      }
+      const prefix = key.slice(0, secondColon);
+      if (!liveFingerprintSectionPrefixes.has(prefix)) {
+        staleCacheKeys.push(key);
+      }
+    }
+    for (const key of staleCacheKeys) {
+      evictParsedCacheEntry(key);
+    }
+
+    // In-flight difft requests are left alone; their results land in
+    // difftJsonBySection and get pruned on the next pass.
+    const filteredQueue = difftQueueRef.current.filter((entry) =>
+      liveSectionIds.has(entry.sectionId),
+    );
+    if (filteredQueue.length !== difftQueueRef.current.length) {
+      difftQueueRef.current = filteredQueue;
+      syncDifftLoading();
+    }
+  }, [state, syncDifftLoading]);
+
+  // Ref breaks the useCallback self-reference cycle inside `.finally`.
+  const processDifftQueueRef = useRef<() => void>(() => {});
+
+  const processDifftQueue = useCallback(() => {
+    while (difftInflightRef.current.size < DIFFT_MAX_INFLIGHT && difftQueueRef.current.length > 0) {
+      const entry = difftQueueRef.current.shift();
+      if (!entry) {
+        break;
+      }
+      difftInflightRef.current.add(entry.sectionId);
+      syncDifftLoading();
+
+      window.codiff
+        .runDifft({
+          newContents: entry.newContents,
+          newName: entry.newName,
+          oldContents: entry.oldContents,
+          oldName: entry.oldName,
+        })
+        .then((result) => {
+          if (!result.json) {
+            // eslint-disable-next-line no-console
+            console.error(`[difft] no JSON for ${entry.path}:`, result.error);
+          }
+          setDifftJsonBySection((current) => ({
+            ...current,
+            [entry.sectionId]: result.json ? { json: result.json } : 'error',
+          }));
+        })
+        .catch((error: unknown) => {
+          // eslint-disable-next-line no-console
+          console.error(`[difft] runDifft rejected for ${entry.path}:`, error);
+          setDifftJsonBySection((current) => ({
+            ...current,
+            [entry.sectionId]: 'error',
+          }));
+        })
+        .finally(() => {
+          difftInflightRef.current.delete(entry.sectionId);
+          syncDifftLoading();
+          processDifftQueueRef.current();
+        });
+    }
+  }, [syncDifftLoading]);
+
+  useEffect(() => {
+    processDifftQueueRef.current = processDifftQueue;
+  }, [processDifftQueue]);
+
+  const enqueueDifft = useCallback(
+    (entry: DifftQueueEntry) => {
+      if (difftInflightRef.current.has(entry.sectionId)) {
+        return;
+      }
+      const queueIndex = difftQueueRef.current.findIndex(
+        (queued) => queued.sectionId === entry.sectionId,
+      );
+      if (queueIndex !== -1) {
+        // Re-queue to the back so it inherits the latest freshness signal.
+        const [existing] = difftQueueRef.current.splice(queueIndex, 1);
+        difftQueueRef.current.push(existing);
+        return;
+      }
+      if (difftQueueRef.current.length >= DIFFT_QUEUE_MAX) {
+        difftQueueRef.current.shift();
+      }
+      difftQueueRef.current.push(entry);
+      syncDifftLoading();
+      processDifftQueue();
+    },
+    [processDifftQueue, syncDifftLoading],
   );
 
   useEffect(() => {
@@ -1159,39 +1376,22 @@ export default function App() {
           (section.loadState != null && section.loadState !== 'ready') ||
           !section.oldFile ||
           !section.newFile ||
-          difftJsonBySection[section.id] ||
-          difftLoadingSectionsRef.current.has(section.id)
+          difftJsonBySection[section.id]
         ) {
           continue;
         }
 
-        difftLoadingSectionsRef.current.add(section.id);
-
-        const oldContents = section.oldFile.contents;
-        const newContents = section.newFile.contents;
-        const oldName = section.oldFile.name;
-        const newName = section.newFile.name;
-
-        window.codiff
-          .runDifft({ newContents, newName, oldContents, oldName })
-          .then((result) => {
-            setDifftJsonBySection((current) => ({
-              ...current,
-              [section.id]: result.json ? { json: result.json } : 'error',
-            }));
-          })
-          .catch(() => {
-            setDifftJsonBySection((current) => ({
-              ...current,
-              [section.id]: 'error',
-            }));
-          })
-          .finally(() => {
-            difftLoadingSectionsRef.current.delete(section.id);
-          });
+        enqueueDifft({
+          newContents: section.newFile.contents,
+          newName: section.newFile.name,
+          oldContents: section.oldFile.contents,
+          oldName: section.oldFile.name,
+          path: file.path,
+          sectionId: section.id,
+        });
       }
     }
-  }, [diffEngine, difftJsonBySection, state, visibleFiles]);
+  }, [diffEngine, difftJsonBySection, enqueueDifft, state, visibleFiles]);
 
   const selectPath = useCallback((path: string) => {
     setSelectedPath(path);
@@ -1348,9 +1548,6 @@ export default function App() {
             <div className="sidebar-path" title={state.root}>
               {compactPath(state.root)}
             </div>
-            {difftAvailable ? (
-              <DiffEngineToggle engine={diffEngine} onChange={setDifftEnginePreference} />
-            ) : null}
           </div>
         </div>
         <Sidebar
@@ -1384,6 +1581,7 @@ export default function App() {
             collapsed={collapsed}
             diffEngine={diffEngine}
             difftJsonBySection={difftJsonStringsBySection}
+            difftLoadingSections={difftLoadingSections}
             files={visibleFiles}
             itemVersionByPath={itemVersionByPath}
             onSelectPathFromScroll={updateSelectedPathFromScroll}
