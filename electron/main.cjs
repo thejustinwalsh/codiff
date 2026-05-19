@@ -28,6 +28,7 @@ const {
   readRepositoryChangeSignature,
   readRepositoryState,
 } = require('./git-state.cjs');
+const { isDifftAvailable, refreshAvailability, runDifft } = require('./difftastic.cjs');
 
 const root = dirname(__dirname);
 const repositoryWatchers = new Map();
@@ -381,3 +382,9 @@ ipcMain.handle('codiff:getRelativePath', async (event, filePath) => {
   const state = await readRepositoryState(repositoryPath);
   return relative(state.root, filePath);
 });
+
+ipcMain.handle('codiff:isDifftAvailable', () => isDifftAvailable());
+
+ipcMain.handle('codiff:refreshDifftAvailability', () => refreshAvailability());
+
+ipcMain.handle('codiff:runDifft', (_event, request) => runDifft(request || {}));
