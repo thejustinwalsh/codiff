@@ -171,6 +171,7 @@
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 600;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   transform: translateY(-6px);
@@ -255,8 +256,56 @@
   display: grid;
   gap: 10px;
   height: 54px;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   padding: 9px 10px;
+}
+
+.codiff-difft-indicator {
+  border: 2px solid transparent;
+  border-radius: 50%;
+  height: 14px;
+  visibility: hidden;
+  width: 14px;
+}
+
+.codiff-difft-indicator[data-state='pending'] {
+  animation: codiff-difft-spin 0.7s linear infinite;
+  border-color: rgb(127 127 127 / 0.2);
+  border-top-color: var(--text);
+  visibility: visible;
+}
+
+.codiff-difft-indicator[data-state='errored'] {
+  background: rgb(214 144 0 / 0.18);
+  border-color: rgb(214 144 0 / 0.55);
+  cursor: help;
+  visibility: visible;
+}
+
+.codiff-difft-indicator[data-state='errored']::before {
+  color: rgb(176 113 0);
+  content: '!';
+  display: block;
+  font: 700 11px/10px var(--font-sans);
+  text-align: center;
+}
+
+@keyframes codiff-difft-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.codiff-sr-only {
+  border: 0;
+  clip: rect(0 0 0 0);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
 }
 
 .codiff-file-header.selected {
