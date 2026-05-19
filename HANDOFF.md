@@ -62,16 +62,21 @@ Codiff's `intraLineRanges` field comes from a pierre fork:
 - Repo: `/Users/tjw/Developer/pierre` (remote `origin` is
   `git@github.com:thejustinwalsh/pierre.git`, upstream is
   `git@github.com:pierrecomputer/pierre.git`).
-- Branch: `feat/intra-line-ranges` (based on tag `diffs-v1.2.0-beta.6`).
-- Uncommitted on that branch:
-  - `packages/diffs/src/types.ts` — adds `intraLineRanges?` to
-    `FileDiffMetadata`, plus `IntraLineRange` and `FileIntraLineRanges`.
-  - `packages/diffs/src/utils/renderDiffWithHighlighter.ts` — checks
-    `diff.intraLineRanges` first; if set, emits `data-diff-span` from the
-    supplied ranges instead of running `diffChars`/`diffWordsWithSpace`.
-  - `packages/diffs/test/intraLineRanges.test.ts` — 4 tests.
-  - `packages/diffs/pierre-diffs-1.2.0-beta.6-difft-ranges.1.tgz` — the
-    packed tarball codiff currently consumes.
+- Branch: `feat/intra-line-ranges` (based on tag `diffs-v1.2.0-beta.6`),
+  pushed to `thejustinwalsh/pierre`.
+- One commit on the branch: `176fbd36 [diffs] Add intraLineRanges field
+to FileDiffMetadata.` Touches `packages/diffs/src/types.ts`,
+  `packages/diffs/src/utils/renderDiffWithHighlighter.ts`,
+  `packages/diffs/test/intraLineRanges.test.ts` (4 tests).
+
+> **REWRITE BEFORE UPSTREAM PR.** Commit subject + body are a draft for
+> easy review on the fork; rewrite per pierre's PR guidelines (single
+> line, no AI references, human-composed) before opening the upstream
+> PR. Use `git commit --amend` and force-push to the fork.
+
+- Local-only artifact (NOT committed):
+  `packages/diffs/pierre-diffs-1.2.0-beta.6-difft-ranges.1.tgz` — packed
+  tarball codiff currently consumes via the workspace override.
 
 The codiff PR cannot land upstream until the pierre changes are
 published (Pierre owns the version cadence).
