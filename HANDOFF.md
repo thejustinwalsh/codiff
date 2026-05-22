@@ -64,8 +64,9 @@ Codiff's `intraLineRanges` field comes from a pierre fork:
   `git@github.com:pierrecomputer/pierre.git`).
 - Branch: `feat/intra-line-ranges` (based on tag `diffs-v1.2.0-beta.6`),
   pushed to `thejustinwalsh/pierre`.
-- One commit on the branch: `176fbd36 [diffs] Add intraLineRanges field
-to FileDiffMetadata.` Touches `packages/diffs/src/types.ts`,
+- One commit on the branch:
+  `176fbd36 [diffs] Add intraLineRanges field to FileDiffMetadata.`
+  Touches `packages/diffs/src/types.ts`,
   `packages/diffs/src/utils/renderDiffWithHighlighter.ts`,
   `packages/diffs/test/intraLineRanges.test.ts` (4 tests).
 
@@ -119,12 +120,13 @@ node bin/codiff.js .                        # → Electron app launches
    own repo, confirm: spinner appears while difft runs, structural
    per-token boxes show on real edits, warning icon appears if difft
    errors, pierre's char-diff falls back on text-mode files.
-2. **Pierre fork**: commit the uncommitted changes on
-   `feat/intra-line-ranges`. Pierre's `AGENTS.md` requires that PR
-   title/body/comments be human-written and disclose AI assistance.
+2. **Rewrite the pierre commit message.** `git commit --amend` on
+   `feat/intra-line-ranges` to replace the draft subject + body with
+   pierre's PR-ready text, then `git push --force-with-lease origin
+feat/intra-line-ranges`.
 3. **Open upstream pierre PR** against `pierrecomputer/pierre`. Justin
-   composes title/body/comments. Tarball can be regenerated as needed
-   while the PR is open.
+   composes title/body/comments per pierre's policy. Tarball can be
+   regenerated as needed while the PR is open.
 4. **Revert** `pnpm-workspace.yaml` + `pnpm-lock.yaml` once the
    `intraLineRanges` field ships in an upstream `@pierre/diffs` release.
    Bump the `@pierre/diffs` dependency to that version.
